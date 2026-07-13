@@ -1,0 +1,625 @@
+# -*- coding: utf-8 -*-
+
+import json
+import re
+from typing import Any, Dict, List, Tuple
+
+import dataiku
+import pandas as pd
+from dataiku import SQLExecutor2
+
+
+# =============================================================================
+# Configuration obligatoire
+# =============================================================================
+
+SQL_CONNECTION = "MA_CONNEXION_IMPALA"
+SOURCE_TABLE = "MA_BASE.vm_rep_cross_actifs"
+OUTPUT_DATASET = "Glossaire"
+
+# Aucun choix automatique du premier LLM :
+# cet identifiant doit obligatoirement être renseigné.
+LLM_ID = "openai:ma-connexion:mon-modele"
+
+MAX_EXAMPLES = 5
+COLUMNS_PER_LLM_CALL = 20
+
+TIMEZONE = "Europe/Paris"
+
+
+# =============================================================================
+# Sécurisation SQL
+# =============================================================================
+
+def validate_table_name(table_name: str) -> str:
+    pattern = (
+        r"^[A-Za-z_][A-Za-z0-9_$]*"
+        r"\.[A-Za-z_][A-Za-z0-9_$]*$"
+    )
+
+    if not re.fullmatch(pattern, table_name or ""):
+        raise ValueError(
+            "SOURCE_TABLE doit être au format `base.table`, "
+            "par exemple `default.vm_rep_cross_actifs`."
+        )
+
+    return table_name
+
+
+def quote_column(column_name: str) -> str:
+    escaped_name = str(column_name).replace("`", "``")
+    return "`%s`" % escaped_name
+
+
+# =============================================================================
+# Lecture du schéma Impala
+# =============================================================================
+
+def read_impala_schema(
+    executor: SQLExecutor2,
+    table_name: str
+) -> List[Dict[str, str]]:
+    """
+    Récupère les colonnes et types natifs avec DESCRIBE.
+    Aucun fallback n'est appliqué.
+    """
+
+    describe_df = executor.query_to_df(
+        "DESCRIBE %s" % table_name
+    )
+
+    if describe_df is None or describe_df.empty:
+        raise RuntimeError(
+            "La commande DESCRIBE n'a retourné aucune colonne "
+            "pour `%s`." % table_name
+        )
+
+    schema: List[Dict[str, str]] = []
+
+    for _, row in describe_df.iterrows():
+        if len(row) < 2:
+            continue
+
+        column_name = str(row.iloc[0]).strip()
+        column_type = str(row.iloc[1]).strip()
+
+        # Les lignes techniques de DESCRIBE commencent généralement par #.
+        if not column_name or column_name.startswith("#"):
+            continue
+
+        if not column_type:
+            raise RuntimeError(
+                "Type Impala absent pour la colonne `%s`."
+                % column_name
+            )
+
+        schema.append(
+            {
+                "colonne": column_name,
+                "type_impala": column_type
+            }
+        )
+
+    if not schema:
+        raise RuntimeError(
+            "Aucune colonne exploitable trouvée dans `%s`."
+            % table_name
+        )
+
+    return schema
+
+
+# =============================================================================
+# Statistiques Impala
+# =============================================================================
+
+def read_total_rows(
+    executor: SQLExecutor2,
+    table_name: str
+) -> int:
+    query = """
+        SELECT COUNT(*) AS n_rows
+        FROM {table}
+    """.format(table=table_name)
+
+    result_df = executor.query_to_df(query)
+
+    if result_df is None or result_df.empty:
+        raise RuntimeError(
+            "Impossible de calculer le nombre de lignes de `%s`."
+            % table_name
+        )
+
+    return int(result_df.iloc[0, 0])
+
+
+def read_column_statistics(
+    executor: SQLExecutor2,
+    table_name: str,
+    column_name: str,
+    total_rows: int
+) -> Dict[str, Any]:
+    """
+    Calcule les statistiques sur toute la table Impala.
+
+    COUNT(colonne) ignore les valeurs NULL.
+    COUNT(DISTINCT colonne) ignore également les valeurs NULL.
+    """
+
+    quoted_column = quote_column(column_name)
+
+    query = """
+        SELECT
+            COUNT({column}) AS n_filled,
+            COUNT(DISTINCT {column}) AS n_distinct
+        FROM {table}
+    """.format(
+        column=quoted_column,
+        table=table_name
+    )
+
+    result_df = executor.query_to_df(query)
+
+    if result_df is None or result_df.empty:
+        raise RuntimeError(
+            "Impossible de calculer les statistiques de `%s`."
+            % column_name
+        )
+
+    values = {
+        str(key).lower(): value
+        for key, value in result_df.iloc[0].items()
+    }
+
+    if "n_filled" not in values or "n_distinct" not in values:
+        raise RuntimeError(
+            "Résultat statistique incomplet pour `%s`."
+            % column_name
+        )
+
+    number_filled = int(values["n_filled"])
+    number_distinct = int(values["n_distinct"])
+
+    null_rate = (
+        round(
+            ((total_rows - number_filled) / total_rows) * 100,
+            2
+        )
+        if total_rows > 0
+        else 0.0
+    )
+
+    return {
+        "taux_null_pct": null_rate,
+        "nb_valeurs_distinctes": number_distinct
+    }
+
+
+# =============================================================================
+# Exemples avec SELECT DISTINCT
+# =============================================================================
+
+def read_distinct_examples(
+    executor: SQLExecutor2,
+    table_name: str,
+    column_name: str
+) -> List[str]:
+    """
+    Récupère jusqu'à MAX_EXAMPLES valeurs distinctes directement dans Impala.
+
+    Exemple de requête produite :
+
+        SELECT DISTINCT `ma_colonne` AS exemple
+        FROM base.table
+        WHERE `ma_colonne` IS NOT NULL
+        LIMIT 5
+    """
+
+    quoted_column = quote_column(column_name)
+
+    query = """
+        SELECT DISTINCT
+            {column} AS exemple
+        FROM {table}
+        WHERE {column} IS NOT NULL
+        LIMIT {limit}
+    """.format(
+        column=quoted_column,
+        table=table_name,
+        limit=MAX_EXAMPLES
+    )
+
+    result_df = executor.query_to_df(query)
+
+    if result_df is None:
+        raise RuntimeError(
+            "Impossible de récupérer les exemples de `%s`."
+            % column_name
+        )
+
+    if result_df.empty:
+        return []
+
+    return [
+        str(value)
+        for value in result_df.iloc[:, 0].tolist()
+    ]
+
+
+# =============================================================================
+# Profil technique
+# =============================================================================
+
+def build_profile(
+    executor: SQLExecutor2,
+    table_name: str
+) -> List[Dict[str, Any]]:
+    """
+    Construit le profil complet directement depuis Impala.
+    """
+
+    schema = read_impala_schema(
+        executor=executor,
+        table_name=table_name
+    )
+
+    total_rows = read_total_rows(
+        executor=executor,
+        table_name=table_name
+    )
+
+    profiles: List[Dict[str, Any]] = []
+
+    for schema_column in schema:
+        column_name = schema_column["colonne"]
+
+        statistics = read_column_statistics(
+            executor=executor,
+            table_name=table_name,
+            column_name=column_name,
+            total_rows=total_rows
+        )
+
+        examples = read_distinct_examples(
+            executor=executor,
+            table_name=table_name,
+            column_name=column_name
+        )
+
+        profiles.append(
+            {
+                "colonne": column_name,
+                "type_impala": schema_column["type_impala"],
+                "exemples": examples,
+                "taux_null_pct": statistics["taux_null_pct"],
+                "nb_valeurs_distinctes": (
+                    statistics["nb_valeurs_distinctes"]
+                ),
+                "nb_lignes_total": total_rows
+            }
+        )
+
+    return profiles
+
+
+# =============================================================================
+# Réponse JSON stricte du LLM
+# =============================================================================
+
+def parse_strict_json_array(
+    response_text: str
+) -> List[Dict[str, Any]]:
+    """
+    Aucun nettoyage ni extraction approximative.
+
+    La réponse doit être directement un tableau JSON valide.
+    """
+
+    if not response_text or not response_text.strip():
+        raise ValueError(
+            "Le LLM a retourné une réponse vide."
+        )
+
+    result = json.loads(response_text.strip())
+
+    if not isinstance(result, list):
+        raise ValueError(
+            "Le LLM doit retourner directement un tableau JSON."
+        )
+
+    if not all(isinstance(item, dict) for item in result):
+        raise ValueError(
+            "Chaque élément de la réponse doit être un objet JSON."
+        )
+
+    return result
+
+
+def validate_generated_glossary(
+    profiles: List[Dict[str, Any]],
+    generated_rows: List[Dict[str, Any]]
+) -> Dict[str, Dict[str, str]]:
+    """
+    Vérifie que toutes les colonnes sont présentes exactement une fois
+    et que tous les champs métier sont renseignés.
+    """
+
+    expected_columns = {
+        profile["colonne"]
+        for profile in profiles
+    }
+
+    glossary_by_column: Dict[str, Dict[str, str]] = {}
+
+    for row in generated_rows:
+        required_fields = {
+            "colonne",
+            "libelle_metier",
+            "definition",
+            "remarques"
+        }
+
+        missing_fields = required_fields - set(row.keys())
+
+        if missing_fields:
+            raise ValueError(
+                "Champs absents dans la réponse du LLM : %s."
+                % ", ".join(sorted(missing_fields))
+            )
+
+        column_name = str(row["colonne"]).strip()
+        business_label = str(row["libelle_metier"]).strip()
+        definition = str(row["definition"]).strip()
+        remarks = str(row["remarques"]).strip()
+
+        if not column_name:
+            raise ValueError(
+                "Une ligne du glossaire possède un nom de colonne vide."
+            )
+
+        if column_name not in expected_columns:
+            raise ValueError(
+                "Le LLM a retourné une colonne inconnue : `%s`."
+                % column_name
+            )
+
+        if column_name in glossary_by_column:
+            raise ValueError(
+                "La colonne `%s` apparaît plusieurs fois dans "
+                "la réponse du LLM." % column_name
+            )
+
+        if not business_label:
+            raise ValueError(
+                "Libellé métier vide pour `%s`."
+                % column_name
+            )
+
+        if not definition:
+            raise ValueError(
+                "Définition vide pour `%s`."
+                % column_name
+            )
+
+        # La remarque doit être explicitement remplie.
+        # Le LLM peut écrire par exemple :
+        # "Aucune remarque particulière."
+        if not remarks:
+            raise ValueError(
+                "Remarques vides pour `%s`."
+                % column_name
+            )
+
+        glossary_by_column[column_name] = {
+            "libelle_metier": business_label,
+            "definition": definition,
+            "remarques": remarks
+        }
+
+    generated_columns = set(glossary_by_column.keys())
+    missing_columns = expected_columns - generated_columns
+
+    if missing_columns:
+        raise ValueError(
+            "Le LLM n'a pas produit de glossaire pour les colonnes : %s."
+            % ", ".join(sorted(missing_columns))
+        )
+
+    return glossary_by_column
+
+
+# =============================================================================
+# Génération du glossaire
+# =============================================================================
+
+def generate_glossary(
+    project,
+    profiles: List[Dict[str, Any]]
+) -> Dict[str, Dict[str, str]]:
+    if not LLM_ID.strip():
+        raise ValueError(
+            "LLM_ID doit obligatoirement être renseigné."
+        )
+
+    llm = project.get_llm(LLM_ID)
+
+    all_generated_rows: List[Dict[str, Any]] = []
+
+    for start_position in range(
+        0,
+        len(profiles),
+        COLUMNS_PER_LLM_CALL
+    ):
+        profile_chunk = profiles[
+            start_position:
+            start_position + COLUMNS_PER_LLM_CALL
+        ]
+
+        prompt = """
+Tu es un Data Steward.
+
+Produis le glossaire métier de la table Impala `%s`.
+
+Retourne directement un tableau JSON valide.
+Ne retourne aucun Markdown, aucun commentaire et aucun texte avant ou
+après le tableau JSON.
+
+Format obligatoire :
+
+[
+  {
+    "colonne": "nom technique exact",
+    "libelle_metier": "libellé métier obligatoire",
+    "definition": "définition métier obligatoire",
+    "remarques": "remarque obligatoire ou 'Aucune remarque particulière.'"
+  }
+]
+
+Contraintes obligatoires :
+
+- produire exactement un objet pour chaque colonne reçue ;
+- conserver exactement le nom technique de chaque colonne ;
+- ne retourner aucune colonne supplémentaire ;
+- ne laisser aucun champ vide ;
+- rédiger en français ;
+- ne pas inventer de règles métier ;
+- utiliser le nom, le type, les statistiques et les exemples distincts ;
+- indiquer les incertitudes dans `remarques` ;
+- signaler les clés potentielles et les données sensibles possibles.
+
+Profil technique :
+
+%s
+""" % (
+            SOURCE_TABLE,
+            json.dumps(
+                profile_chunk,
+                ensure_ascii=False,
+                default=str,
+                indent=2
+            )
+        )
+
+        completion = llm.new_completion()
+        completion.settings["temperature"] = 0.0
+        completion.settings["maxOutputTokens"] = 5000
+
+        completion.with_message(
+            prompt,
+            role="user"
+        )
+
+        response = completion.execute()
+
+        if not getattr(response, "success", False):
+            raise RuntimeError(
+                "Échec de l'appel au LLM Mesh."
+            )
+
+        generated_rows = parse_strict_json_array(
+            getattr(response, "text", "")
+        )
+
+        all_generated_rows.extend(generated_rows)
+
+    return validate_generated_glossary(
+        profiles=profiles,
+        generated_rows=all_generated_rows
+    )
+
+
+# =============================================================================
+# Construction stricte de la sortie
+# =============================================================================
+
+def build_output_dataframe(
+    profiles: List[Dict[str, Any]],
+    glossary_by_column: Dict[str, Dict[str, str]]
+) -> pd.DataFrame:
+    insertion_date = (
+        pd.Timestamp.now(tz=TIMEZONE)
+        .tz_localize(None)
+        .floor("s")
+    )
+
+    rows: List[Dict[str, Any]] = []
+
+    for profile in profiles:
+        column_name = profile["colonne"]
+
+        # Accès direct :
+        # une absence provoque une erreur, sans fallback.
+        business_data = glossary_by_column[column_name]
+
+        rows.append(
+            {
+                "table_source": SOURCE_TABLE,
+                "colonne": column_name,
+                "libelle_metier": business_data["libelle_metier"],
+                "definition": business_data["definition"],
+                "type_impala": profile["type_impala"],
+                "exemples": json.dumps(
+                    profile["exemples"],
+                    ensure_ascii=False,
+                    default=str
+                ),
+                "taux_null_pct": profile["taux_null_pct"],
+                "nb_valeurs_distinctes": (
+                    profile["nb_valeurs_distinctes"]
+                ),
+                "nb_lignes_total": profile["nb_lignes_total"],
+                "remarques": business_data["remarques"],
+                "date_insertion": insertion_date
+            }
+        )
+
+    output_df = pd.DataFrame(rows)
+
+    if output_df.empty:
+        raise RuntimeError(
+            "Le glossaire généré est vide."
+        )
+
+    output_df["date_insertion"] = pd.to_datetime(
+        output_df["date_insertion"]
+    )
+
+    return output_df
+
+
+# =============================================================================
+# Exécution
+# =============================================================================
+
+SOURCE_TABLE = validate_table_name(SOURCE_TABLE)
+
+executor = SQLExecutor2(
+    connection=SQL_CONNECTION
+)
+
+technical_profiles = build_profile(
+    executor=executor,
+    table_name=SOURCE_TABLE
+)
+
+client = dataiku.api_client()
+project = client.get_default_project()
+
+business_glossary = generate_glossary(
+    project=project,
+    profiles=technical_profiles
+)
+
+glossary_df = build_output_dataframe(
+    profiles=technical_profiles,
+    glossary_by_column=business_glossary
+)
+
+# L'écriture n'est réalisée qu'après validation complète du glossaire.
+output_dataset = dataiku.Dataset(OUTPUT_DATASET)
+output_dataset.write_with_schema(glossary_df)
+
+print(
+    "%d ligne(s) écrite(s) dans `%s`."
+    % (len(glossary_df), OUTPUT_DATASET)
+)
