@@ -1,0 +1,386 @@
+# -*- coding: utf-8 -*-
+"""
+Recette Python Dataiku
+Entrée  : vm_rep_cross_actifs
+Sortie  : Glossaire
+"""
+
+import json
+import re
+from typing import Any, Dict, List
+
+import dataiku
+import pandas as pd
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+INPUT_DATASET = "vm_rep_cross_actifs"
+OUTPUT_DATASET = "Glossaire"
+
+# Exemple : "openai:ma-connexion:gpt-4o"
+# Si vide, la recette prend le premier LLM disponible dans le projet.
+LLM_ID = ""
+
+USE_LLM = True
+
+# Nombre maximal de lignes utilisées pour calculer les statistiques.
+# Mettre None pour lire tout le dataset.
+PROFILE_MAX_ROWS = 50_000
+
+MAX_EXAMPLES = 5
+MAX_EXAMPLE_LENGTH = 80
+COLUMNS_PER_LLM_CALL = 20
+
+TIMEZONE = "Europe/Paris"
+
+
+# =============================================================================
+# Fonctions utilitaires
+# =============================================================================
+
+def resolve_llm_id(project) -> str:
+    """Retourne le LLM configuré ou le premier LLM disponible."""
+
+    if LLM_ID:
+        return LLM_ID
+
+    llms = project.list_llms()
+
+    if not llms:
+        raise RuntimeError(
+            "Aucun LLM n'est disponible dans le projet Dataiku. "
+            "Renseignez LLM_ID ou configurez une connexion LLM Mesh."
+        )
+
+    first_llm = llms[0]
+
+    if hasattr(first_llm, "id"):
+        return first_llm.id
+
+    return first_llm["id"]
+
+
+def read_input_dataframe(dataset: dataiku.Dataset) -> pd.DataFrame:
+    """Lit le dataset source, avec une limite facultative."""
+
+    if PROFILE_MAX_ROWS is None:
+        return dataset.get_dataframe()
+
+    return dataset.get_dataframe(
+        sampling="head",
+        limit=PROFILE_MAX_ROWS
+    )
+
+
+def safe_examples(series: pd.Series) -> List[str]:
+    """Extrait quelques exemples non nuls et distincts."""
+
+    try:
+        return (
+            series.dropna()
+            .astype(str)
+            .str.slice(0, MAX_EXAMPLE_LENGTH)
+            .drop_duplicates()
+            .head(MAX_EXAMPLES)
+            .tolist()
+        )
+    except Exception:
+        return []
+
+
+def profile_dataset(
+    dataframe: pd.DataFrame,
+    schema: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Construit le profil technique de chaque colonne."""
+
+    profiles: List[Dict[str, Any]] = []
+    number_of_rows = len(dataframe)
+
+    for schema_column in schema:
+        column_name = schema_column["name"]
+        source_type = schema_column.get("type", "inconnu")
+
+        if column_name in dataframe.columns:
+            series = dataframe[column_name]
+        else:
+            series = pd.Series(dtype="object")
+
+        null_rate = None
+
+        if number_of_rows > 0:
+            null_rate = round(
+                float(series.isna().mean() * 100),
+                2
+            )
+
+        try:
+            distinct_count = int(series.nunique(dropna=True))
+        except Exception:
+            distinct_count = None
+
+        profiles.append(
+            {
+                "colonne": column_name,
+                "type_source": source_type,
+                "type_pandas": str(series.dtype),
+                "exemples": safe_examples(series),
+                "taux_null_pct": null_rate,
+                "nb_valeurs_distinctes": distinct_count,
+                "nb_lignes_profilees": number_of_rows,
+            }
+        )
+
+    return profiles
+
+
+def extract_json_array(text: str) -> List[Dict[str, Any]]:
+    """Extrait un tableau JSON de la réponse du LLM."""
+
+    cleaned_text = (text or "").strip()
+
+    cleaned_text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        cleaned_text,
+        flags=re.IGNORECASE
+    )
+    cleaned_text = re.sub(r"\s*```$", "", cleaned_text)
+
+    try:
+        result = json.loads(cleaned_text)
+    except json.JSONDecodeError:
+        start = cleaned_text.find("[")
+        end = cleaned_text.rfind("]")
+
+        if start < 0 or end < start:
+            raise ValueError(
+                "La réponse du LLM ne contient pas de tableau JSON valide."
+            )
+
+        result = json.loads(cleaned_text[start:end + 1])
+
+    if not isinstance(result, list):
+        raise ValueError(
+            "La réponse du LLM doit être un tableau JSON."
+        )
+
+    return [
+        item for item in result
+        if isinstance(item, dict)
+    ]
+
+
+def generate_business_glossary(
+    project,
+    profiles: List[Dict[str, Any]]
+) -> Dict[str, Dict[str, str]]:
+    """Génère les libellés et définitions métier avec le LLM Mesh."""
+
+    glossary_by_column: Dict[str, Dict[str, str]] = {}
+    llm = project.get_llm(resolve_llm_id(project))
+
+    for start in range(0, len(profiles), COLUMNS_PER_LLM_CALL):
+        profile_chunk = profiles[start:start + COLUMNS_PER_LLM_CALL]
+
+        prompt = """
+Tu es un Data Steward chargé de produire un glossaire métier.
+
+Le dataset source est `vm_rep_cross_actifs`.
+
+À partir du profil technique fourni, retourne exclusivement un tableau JSON.
+Ne retourne aucun texte avant ou après le JSON et n'utilise pas de bloc Markdown.
+
+Un objet doit être produit pour chaque colonne, dans le format suivant :
+
+[
+  {
+    "colonne": "nom exact de la colonne",
+    "libelle_metier": "libellé clair et lisible",
+    "definition": "définition métier précise",
+    "remarques": "incertitudes, clé possible, donnée sensible ou anomalie"
+  }
+]
+
+Règles :
+- conserve exactement les noms techniques des colonnes ;
+- n'invente pas de règle métier non démontrée ;
+- base-toi sur le nom, le type et les exemples ;
+- lorsqu'une définition est incertaine, indique-le dans `remarques` ;
+- signale les identifiants, dates, montants, devises, taux et données sensibles ;
+- rédige en français ;
+- retourne une définition courte, exploitable dans un catalogue de données.
+
+Profil technique :
+
+%s
+""" % json.dumps(
+            profile_chunk,
+            ensure_ascii=False,
+            default=str,
+            indent=2
+        )
+
+        completion = llm.new_completion()
+
+        try:
+            completion.settings["temperature"] = 0.1
+            completion.settings["maxOutputTokens"] = 5000
+        except Exception:
+            pass
+
+        completion.with_message(prompt, role="user")
+        response = completion.execute()
+
+        if not getattr(response, "success", False):
+            raise RuntimeError(
+                "Échec de l'appel au LLM Mesh pendant la génération "
+                "du glossaire."
+            )
+
+        llm_rows = extract_json_array(
+            getattr(response, "text", "") or ""
+        )
+
+        for row in llm_rows:
+            column_name = str(row.get("colonne", "")).strip()
+
+            if not column_name:
+                continue
+
+            glossary_by_column[column_name] = {
+                "libelle_metier": str(
+                    row.get("libelle_metier", "")
+                ).strip(),
+                "definition": str(
+                    row.get("definition", "")
+                ).strip(),
+                "remarques": str(
+                    row.get("remarques", "")
+                ).strip(),
+            }
+
+    return glossary_by_column
+
+
+def fallback_label(column_name: str) -> str:
+    """Crée un libellé lisible lorsque le LLM n'est pas utilisé."""
+
+    label = re.sub(r"[_\-]+", " ", column_name)
+    label = re.sub(r"\s+", " ", label).strip()
+
+    return label[:1].upper() + label[1:] if label else column_name
+
+
+def build_output_dataframe(
+    profiles: List[Dict[str, Any]],
+    business_glossary: Dict[str, Dict[str, str]]
+) -> pd.DataFrame:
+    """Fusionne le profil technique et les définitions métier."""
+
+    insertion_date = (
+        pd.Timestamp.now(tz=TIMEZONE)
+        .tz_localize(None)
+        .floor("s")
+    )
+
+    output_rows: List[Dict[str, Any]] = []
+
+    for profile in profiles:
+        column_name = profile["colonne"]
+        business_info = business_glossary.get(column_name, {})
+
+        label = business_info.get("libelle_metier")
+
+        if not label:
+            label = fallback_label(column_name)
+
+        definition = business_info.get("definition")
+
+        if not definition:
+            definition = (
+                "Colonne `%s` du dataset `%s`."
+                % (column_name, INPUT_DATASET)
+            )
+
+        remarks = business_info.get("remarques", "")
+
+        output_rows.append(
+            {
+                "dataset_source": INPUT_DATASET,
+                "colonne": column_name,
+                "libelle_metier": label,
+                "definition": definition,
+                "type_source": profile["type_source"],
+                "type_pandas": profile["type_pandas"],
+                "exemples": json.dumps(
+                    profile["exemples"],
+                    ensure_ascii=False
+                ),
+                "taux_null_pct": profile["taux_null_pct"],
+                "nb_valeurs_distinctes": (
+                    profile["nb_valeurs_distinctes"]
+                ),
+                "nb_lignes_profilees": (
+                    profile["nb_lignes_profilees"]
+                ),
+                "remarques": remarks,
+                "date_insertion": insertion_date,
+            }
+        )
+
+    output_dataframe = pd.DataFrame(output_rows)
+
+    # Garantit que Dataiku reconnaît la colonne comme une date/heure.
+    output_dataframe["date_insertion"] = pd.to_datetime(
+        output_dataframe["date_insertion"]
+    )
+
+    return output_dataframe
+
+
+# =============================================================================
+# Exécution de la recette
+# =============================================================================
+
+input_dataset = dataiku.Dataset(INPUT_DATASET)
+output_dataset = dataiku.Dataset(OUTPUT_DATASET)
+
+input_schema = input_dataset.read_schema()
+input_dataframe = read_input_dataframe(input_dataset)
+
+technical_profiles = profile_dataset(
+    dataframe=input_dataframe,
+    schema=input_schema
+)
+
+if USE_LLM:
+    client = dataiku.api_client()
+    project = client.get_default_project()
+
+    business_glossary = generate_business_glossary(
+        project=project,
+        profiles=technical_profiles
+    )
+else:
+    business_glossary = {}
+
+glossary_dataframe = build_output_dataframe(
+    profiles=technical_profiles,
+    business_glossary=business_glossary
+)
+
+output_dataset.write_with_schema(glossary_dataframe)
+
+print(
+    "Glossaire généré : %d colonne(s), date d'insertion : %s"
+    % (
+        len(glossary_dataframe),
+        glossary_dataframe["date_insertion"].iloc[0]
+        if not glossary_dataframe.empty
+        else "N/A"
+    )
+)
