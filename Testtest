@@ -1,0 +1,16 @@
+import dataiku
+import pandas as pd
+from dataiku.core.sql import SQLExecutor2
+
+executor = SQLExecutor2(connection="NOM_CONNEXION_IMPALA")
+
+dbs = executor.query_to_df("SHOW DATABASES")
+lignes = []
+for base in dbs.iloc[:, 0]:
+    if base == "_impala_builtins":
+        continue
+    tables = executor.query_to_df(f"SHOW TABLES IN `{base}`")
+    lignes += [{"base": base, "nom_table": t} for t in tables.iloc[:, 0]]
+
+sortie = dataiku.Dataset("catalogue_tables")
+sortie.write_with_schema(pd.DataFrame(lignes))
