@@ -1,0 +1,145 @@
+<?xml version='1.0' encoding='utf-8' ?>
+
+<!--
+  ============================================================================
+  Tableau Datasource Customization (.tdc)
+  Connecteur : Cloudera Hadoop (Hive) - Cloudera ODBC Driver for Apache Hive
+  ============================================================================
+
+  VERIFICATION DES NOMS (a faire une fois) :
+  Si le fichier semble sans effet, les attributs vendor/driver ne matchent pas.
+  Se connecter une fois depuis Tableau, puis ouvrir :
+      Mon referentiel Tableau/Logs/log.txt
+  et chercher "connection-customization" ou "attributes". Les valeurs reelles
+  renvoyees par le driver y figurent (selon la version du driver, vendor peut
+  etre 'Hive' ou 'Apache Hive'). Corriger ci-dessous si necessaire.
+
+  EMPLACEMENT :
+    Desktop (Win) : C:\Users\<user>\Documents\Mon referentiel Tableau\Sources de donnees\
+    Desktop (Mac) : ~/Documents/Mon referentiel Tableau/Sources de donnees/
+    Server (Win)  : C:\ProgramData\Tableau\Tableau Server\data\tabsvc\vizqlserver\Datasources\
+                    ET ...\tabsvc\dataserver\Datasources\
+                    puis redemarrage des services.
+
+  Redemarrer Tableau apres toute modification.
+  Un seul bloc <connection-customization> par fichier : le premier est utilise.
+  ============================================================================
+-->
+
+<connection-customization class='cloudera_hive' enabled='true' version='2018.1'>
+
+  <vendor name='Hive' />
+  <driver name='Cloudera ODBC Driver for Apache Hive' />
+
+  <customizations>
+
+    <!-- ===== 1. RECUPERATION DES LIGNES (gain principal) ===== -->
+
+    <!-- Options passees directement au driver Cloudera :
+         RowsFetchedPerBlock  : lignes rapatriees par aller-retour reseau.
+                                Defaut 10 000 -> 100 000 = ~10x moins de
+                                round-trips sur un gros extrait.
+                                Redescendre a 50 000 si RAM client limitee.
+         AsyncExecPollInterval: intervalle (ms) de polling du job HiveServer2.
+                                Defaut 100 ms. A 10 ms, les requetes courtes
+                                (apercus, filtres) repondent nettement plus vite.
+         SocketTimeout=0      : pas de coupure sur les longues requetes. -->
+    <customization name='odbc-connect-string-extras'
+                   value='RowsFetchedPerBlock=100000;AsyncExecPollInterval=10;SocketTimeout=0' />
+
+    <!-- Curseur avant-seulement : seul mode reellement supporte par Hive,
+         evite au driver d'emuler un curseur scrollable en memoire. -->
+    <customization name='CAP_ODBC_CURSOR_FORWARD_ONLY' value='yes' />
+    <customization name='CAP_ODBC_CURSOR_DYNAMIC' value='no' />
+    <customization name='CAP_ODBC_CURSOR_KEYSET_DRIVEN' value='no' />
+    <customization name='CAP_ODBC_CURSOR_STATIC' value='no' />
+
+    <!-- Binding par bloc plutot que ligne par ligne. -->
+    <customization name='CAP_ODBC_FORCE_SINGLE_ROW_BINDING' value='no' />
+    <customization name='CAP_ODBC_UNBIND_AUTO' value='yes' />
+    <customization name='CAP_ODBC_REBIND_SKIP_UNBIND' value='yes' />
+
+    <!-- Ne pas allouer les buffers a la longueur max declaree pour les STRING.
+         Le driver Cloudera annonce 255 par defaut (DefaultStringColumnLength) ;
+         si votre DSN l'a augmente, ce reglage evite l'explosion memoire. -->
+    <customization name='CAP_ODBC_BIND_FORCE_MAX_STRING_BUFFERS' value='no' />
+    <customization name='CAP_ODBC_BIND_SUPPRESS_PREFERRED_TYPES' value='yes' />
+
+    <!-- Arret immediat sur erreur de fetch. -->
+    <customization name='CAP_ODBC_FETCH_CONTINUE_ON_ERROR' value='no' />
+
+
+    <!-- ===== 2. METADONNEES (latence connexion / ouverture classeur) ===== -->
+
+    <!-- Ne pas executer une vraie requete juste pour decouvrir le schema :
+         sur Hive cela declenche un job complet. -->
+    <customization name='CAP_ODBC_METADATA_SUPPRESS_EXECUTED_QUERY' value='yes' />
+    <customization name='CAP_ODBC_METADATA_SUPPRESS_PREPARED_QUERY' value='no' />
+
+    <!-- Utiliser l'API SQLColumns au lieu d'un SELECT * de sondage. -->
+    <customization name='CAP_ODBC_METADATA_SUPPRESS_SELECT_STAR' value='yes' />
+
+    <!-- Hive n'expose ni cles primaires/etrangeres ni statistiques :
+         ces appels ne renvoient rien mais coutent des secondes. -->
+    <customization name='CAP_ODBC_METADATA_SUPPRESS_SQLPRIMARYKEYS_API' value='yes' />
+    <customization name='CAP_ODBC_METADATA_SUPPRESS_SQLFOREIGNKEYS_API' value='yes' />
+    <customization name='CAP_ODBC_METADATA_SUPPRESS_SQLSTATISTICS_API' value='yes' />
+    <customization name='CAP_ODBC_SUPPRESS_INFO_SCHEMA_STATS' value='yes' />
+
+    <!-- Supprime les requetes de decouverte de capacites a la connexion. -->
+    <customization name='CAP_SUPPRESS_DISCOVERY_QUERIES' value='yes' />
+    <customization name='CAP_FAST_METADATA' value='yes' />
+
+
+    <!-- ===== 3. TRANSACTIONS (inexistantes sur Hive) ===== -->
+
+    <customization name='CAP_ODBC_TRANSACTIONS_SUPPRESS_AUTO_COMMIT' value='yes' />
+    <customization name='CAP_ODBC_TRANSACTIONS_SUPPRESS_EXPLICIT_COMMIT' value='yes' />
+    <customization name='CAP_ISOLATION_LEVEL_READ_UNCOMMITTED' value='yes' />
+
+
+    <!-- ===== 4. GENERATION SQL ===== -->
+
+    <customization name='CAP_CREATE_TEMP_TABLES' value='no' />
+    <customization name='CAP_SELECT_INTO' value='no' />
+    <customization name='CAP_SELECT_TOP_INTO' value='no' />
+
+    <!-- HiveQL : GROUP BY / ORDER BY par position, pas par alias. -->
+    <customization name='CAP_QUERY_GROUP_BY_ALIAS' value='no' />
+    <customization name='CAP_QUERY_GROUP_BY_DEGREE' value='yes' />
+    <customization name='CAP_QUERY_SORT_BY_DEGREE' value='yes' />
+
+    <!-- LIMIT n : evite que les apercus scannent toute la table. -->
+    <customization name='CAP_QUERY_TOP_N' value='yes' />
+
+    <!-- Sous-requetes : OK sur HiveServer2 recent.
+         Passer a 'no' si des visualisations echouent sur un cluster ancien. -->
+    <customization name='CAP_QUERY_SUBQUERIES' value='yes' />
+
+  </customizations>
+
+</connection-customization>
+
+<!--
+  ============================================================================
+  OPTIONS A TESTER (a ajouter dans odbc-connect-string-extras si besoin)
+  ============================================================================
+
+  GetTablesWithQuery=1
+      Liste les tables via SHOW TABLES au lieu de l'API metadonnees
+      HiveServer2. Souvent beaucoup plus rapide quand le metastore contient
+      des milliers de tables ; parfois plus lent sinon. A mesurer.
+
+  UseNativeQuery=1
+      Le driver n'essaie plus de traduire le SQL genere par Tableau et
+      l'envoie tel quel a Hive. Economise du temps de parsing, mais peut
+      casser certaines requetes Tableau. A valider sur un classeur complet.
+
+  DefaultStringColumnLength=255
+      A ne baisser que si vos colonnes STRING sont courtes : reduit
+      directement la taille des buffers de fetch. Attention a la troncature.
+
+  Rappel : les .tdc sont fournis "tels quels" par Tableau et ne sont pas
+  couverts par leur support. Mesurer avant/apres sur un classeur temoin.
+  ============================================================================
+-->
